@@ -4,12 +4,15 @@ import time
 import json
 import pathlib
 from typing import List, Set, Dict, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 import requests
 from bs4 import BeautifulSoup
+from pathlib import Path
 
 # ================== CONFIG ==================
-SUBSCRIPTIONS_FILE = "subscriptions.txt"  # one per line, e.g. Artoria+Caster
+
+SCRIPT_DIR = Path(__file__).parent
+SUBSCRIPTIONS_FILE = SCRIPT_DIR / "subscriptions.txt"  # <- lives next to the script
 DEST_DIR = pathlib.Path.home() / "Pictures" / "Zerochan"
 DEST_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -17,7 +20,7 @@ DEST_DIR.mkdir(parents=True, exist_ok=True)
 MAX_PAGES_PER_TAG = 3
 
 # Delay between HTTP requests (be gentle)
-REQUEST_DELAY = 0.8
+REQUEST_DELAY = 2
 
 # Debug knobs
 DEBUG = True
@@ -105,21 +108,45 @@ def find_thumbs_ul(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
     return None
 
 def extract_ids_from_ul(ul: BeautifulSoup) -> List[str]:
-    ids: List[str] = []
-    # Prefer direct children; fallback to nested if needed
-    lis = ul.find_all("li", recursive=False)
-    if not lis:
-        lis = ul.find_all("li")
+    ids: Set[str] = set()
+    lis = ul.find_all("li", recursive=False) or ul.find_all("li")
+
     for li in lis:
+        # Strategy A: /1234567 in a.thumb href
         a_thumb = li.select_one("div > a.thumb")
-        if not a_thumb:
-            continue
-        href = a_thumb.get("href", "")
-        m = re.search(r"/(\d+)", href)
-        if m:
-            ids.append(m.group(1))
+        if a_thumb:
+            href = a_thumb.get("href", "")
+            m = re.search(r"/(\d+)(?:[/?#]|$)", href)
+            if m:
+                ids.add(m.group(1))
+                continue
+
+        # Strategy B: a.fav[data-id]
+        a_fav = li.select_one("a.fav")
+        if a_fav:
+            did = a_fav.get("data-id")
+            if did and did.isdigit():
+                ids.add(did)
+                continue
+
+        # Strategy C: any element with data-id
+        node = li.select_one("[data-id]")
+        if node:
+            did = node.get("data-id")
+            if did and did.isdigit():
+                ids.add(did)
+                continue
+
+        # Strategy D: any <a href="/123…"> inside the li
+        for a in li.select("a[href]"):
+            m = re.search(r"/(\d+)(?:[/?#]|$)", a["href"])
+            if m:
+                ids.add(m.group(1))
+                break
+
     log(f"[DEBUG] Extracted {len(ids)} IDs from container")
-    return ids
+    return sorted(ids)
+
 
 def head_or_get_exists(url: str) -> bool:
     try:
@@ -143,20 +170,24 @@ def head_or_get_exists(url: str) -> bool:
 # ================== CORE ==================
 def page_urls_for_subscription(sub_plus: str, max_pages: int) -> List[str]:
     """
-    Build: page 1 = https://www.zerochan.net/<sub_plus>
+    Build: page 1 = https://www.zerochan.net/<slug>
            page n = …?p=n
-    Keep '+' as '+' in the path (Zerochan uses that style).
+    We first unquote to neutralize any pre-encoded %xx, normalize spaces to '+',
+    then quote again with '+' kept as is.
     """
-    base = f"https://www.zerochan.net/{quote(sub_plus, safe='+')}"
+    normalized = unquote(sub_plus).replace(" ", "+")
+    slug = quote(normalized, safe="+")  # prevents % -> %25 double-encoding
+    base = f"https://www.zerochan.net/{slug}"
     urls = [base]
     for i in range(2, max_pages + 1):
         urls.append(f"{base}?p={i}")
     return urls
 
+
 def static_candidates(sub_plus: str, img_id: str) -> List[str]:
     """
     Make .jpg first, then .png
-    https://static.zerochan.net/<Name.Dots>.full.<id>.jpg
+    https://static.zerochan.net/<Name.Dot9s>.full.<id>.jpg
     """
     name_dots = sub_plus.replace("+", ".")
     base = f"https://static.zerochan.net/{name_dots}.full.{img_id}"
