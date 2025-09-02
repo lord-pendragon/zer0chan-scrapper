@@ -3,6 +3,7 @@ import re
 import time
 import json
 import pathlib
+import shutil
 from typing import List, Set, Dict, Optional
 from urllib.parse import quote, unquote
 import requests
@@ -12,7 +13,7 @@ from pathlib import Path
 # ================== CONFIG ==================
 
 SCRIPT_DIR = Path(__file__).parent
-SUBSCRIPTIONS_FILE = SCRIPT_DIR / "subscriptions.txt"  # <- lives next to the script
+SUBSCRIPTIONS_FILE = SCRIPT_DIR / "subscriptions.txt"  # lives next to the script
 DEST_DIR = pathlib.Path.home() / "Pictures" / "Zerochan"
 DEST_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -46,9 +47,109 @@ def log(msg: str):
     if DEBUG:
         print(msg, flush=True)
 
+# ================== HELPERS ==================
+_illegal = r'[<>:"/\\|?*]'
+
+def folder_name_from_subscription(sub_plus: str) -> str:
+    """
+    Make a readable, safe folder name on Windows:
+    - decode %xx → unicode (UTF-8)
+    - '+' → space
+    - replace path-forbidden chars with space
+    - collapse/trim spaces; strip trailing dots/spaces
+    """
+    s = unquote(sub_plus).replace("+", " ")
+    s = re.sub(_illegal, " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.rstrip(". ")
+    # avoid reserved device names (CON, PRN, AUX, NUL, COM1, LPT1, ...)
+    reserved = {*(f"COM{i}" for i in range(1, 10)),
+                *(f"LPT{i}" for i in range(1, 10)),
+                "CON", "PRN", "AUX", "NUL"}
+    if s.upper() in reserved:
+        s = s + " _"
+    return s or "Unnamed"
+
+# ---------- Preflight migration from root to per-character folders ----------
+
+def migrate_root_files_to_char_folders(root_dir: Path, subs: List[str]) -> None:
+    """
+    Move files sitting directly in root_dir into their character subfolders
+    if we can determine the character from the filename.
+    Supports:
+      1) <charDots>_<id>.(jpg|jpeg|png)
+      2) <charDots>.full.<id>.(jpg|jpeg|png)
+    Only moves when <charDots> matches a subscription (case-insensitive).
+    """
+    # map charDots -> subscription "+ form"
+    dots_to_sub = { sub.replace("+", ".").lower(): sub for sub in subs }
+
+    rx_pair   = re.compile(r"^(?P<char>.+?)_(?P<id>\d+)\.(?P<ext>jpg|jpeg|png)$", re.IGNORECASE)
+    rx_static = re.compile(r"^(?P<char>.+?)\.full\.(?P<id>\d+)\.(?P<ext>jpg|jpeg|png)$", re.IGNORECASE)
+
+    moved = 0
+    for p in list(root_dir.iterdir()):
+        if not p.is_file():
+            continue
+
+        m = rx_pair.match(p.name) or rx_static.match(p.name)
+        if not m:
+            continue
+
+        char_dots = m.group("char")
+        img_id    = m.group("id")
+        ext       = "." + m.group("ext").lower().replace("jpeg","jpg")
+
+        sub = dots_to_sub.get(char_dots.lower())
+        if not sub:
+            log(f"  [MIGR] skip (unknown char for this filename): {p.name}")
+            continue
+
+        # Destination folder and filename
+        char_folder = (DEST_DIR / folder_name_from_subscription(sub))
+        char_folder.mkdir(parents=True, exist_ok=True)
+        dest = char_folder / f"{char_dots}_{img_id}{ext}"
+
+        if dest.exists():
+            log(f"  [MIGR] duplicate exists, removing source: {p.name}")
+            try:
+                p.unlink()  # remove the extra copy in root
+            except Exception as e:
+                log(f"  [MIGR] could not remove duplicate: {e}")
+            continue
+
+        try:
+            shutil.move(str(p), str(dest))
+            log(f"  [MIGR] moved → {char_folder.name}\\{dest.name}")
+            moved += 1
+        except Exception as e:
+            log(f"  [MIGR] move failed for {p.name}: {e}")
+
+    log(f"[MIGR] total moved: {moved}")
+
+
+def build_existing_ids_for_char(char_folder: Path) -> Set[str]:
+    """
+    Scan a character's folder for IDs. Accepts either:
+      <charDots>_<id>.jpg  OR  <id>.jpg
+    Returns set of string IDs.
+    """
+    ids: Set[str] = set()
+    rx_pair = re.compile(r"^.+?_(\d+)\.(?:jpg|jpeg|png)$", re.IGNORECASE)
+    rx_id   = re.compile(r"^(\d+)\.(?:jpg|jpeg|png)$", re.IGNORECASE)
+    if not char_folder.exists():
+        return ids
+    for p in char_folder.iterdir():
+        if not p.is_file(): 
+            continue
+        m = rx_pair.match(p.name) or rx_id.match(p.name)
+        if m:
+            ids.add(m.group(1))
+    return ids
+
 # ================== PRE/POST ==================
-def load_subscriptions(path: str) -> List[str]:
-    if not os.path.exists(path):
+def load_subscriptions(path: Path) -> List[str]:
+    if not path.exists():
         print(f"[ERROR] Subscriptions file not found: {path}")
         return []
     subs = []
@@ -60,25 +161,6 @@ def load_subscriptions(path: str) -> List[str]:
             subs.append(s)
     log(f"[INFO] Loaded {len(subs)} subscriptions: {subs}")
     return subs
-
-def build_existing_index(folder: pathlib.Path) -> Dict[str, Set[str]]:
-    """
-    Build {character_dots_lower -> set(ids)} by scanning filenames like
-    Artoria.Caster_4572543.jpg  (or .png)
-    """
-    idx: Dict[str, Set[str]] = {}
-    rx = re.compile(r"^(?P<char>.+?)_(?P<id>\d+)\.(?:jpg|jpeg|png)$", re.IGNORECASE)
-    for p in folder.iterdir():
-        if not p.is_file():
-            continue
-        m = rx.match(p.name)
-        if not m:
-            continue
-        char_dots = m.group("char").lower()
-        img_id = m.group("id")
-        idx.setdefault(char_dots, set()).add(img_id)
-    log(f"[INFO] Preflight index built for {len(idx)} characters")
-    return idx
 
 # ================== HTTP / PARSE ==================
 def get_soup(url: str, dump_name: Optional[str] = None) -> Optional[BeautifulSoup]:
@@ -112,7 +194,7 @@ def extract_ids_from_ul(ul: BeautifulSoup) -> List[str]:
     lis = ul.find_all("li", recursive=False) or ul.find_all("li")
 
     for li in lis:
-        # Strategy A: /1234567 in a.thumb href
+        # A: /1234567 in a.thumb href
         a_thumb = li.select_one("div > a.thumb")
         if a_thumb:
             href = a_thumb.get("href", "")
@@ -121,7 +203,7 @@ def extract_ids_from_ul(ul: BeautifulSoup) -> List[str]:
                 ids.add(m.group(1))
                 continue
 
-        # Strategy B: a.fav[data-id]
+        # B: a.fav[data-id]
         a_fav = li.select_one("a.fav")
         if a_fav:
             did = a_fav.get("data-id")
@@ -129,7 +211,7 @@ def extract_ids_from_ul(ul: BeautifulSoup) -> List[str]:
                 ids.add(did)
                 continue
 
-        # Strategy C: any element with data-id
+        # C: any [data-id]
         node = li.select_one("[data-id]")
         if node:
             did = node.get("data-id")
@@ -137,7 +219,7 @@ def extract_ids_from_ul(ul: BeautifulSoup) -> List[str]:
                 ids.add(did)
                 continue
 
-        # Strategy D: any <a href="/123…"> inside the li
+        # D: any <a href="/123…">
         for a in li.select("a[href]"):
             m = re.search(r"/(\d+)(?:[/?#]|$)", a["href"])
             if m:
@@ -147,33 +229,12 @@ def extract_ids_from_ul(ul: BeautifulSoup) -> List[str]:
     log(f"[DEBUG] Extracted {len(ids)} IDs from container")
     return sorted(ids)
 
-
-def head_or_get_exists(url: str) -> bool:
-    try:
-        hr = SESSION.head(url, timeout=TIMEOUT, allow_redirects=True)
-        log(f"    [HEAD] {url} -> {hr.status_code}")
-        if hr.status_code == 200:
-            return True
-        if hr.status_code in (403, 404):
-            return False
-    except Exception as e:
-        log(f"    [HEAD] error: {e}")
-    # fallback GET (some servers don’t HEAD properly)
-    try:
-        gr = SESSION.get(url, stream=True, timeout=TIMEOUT)
-        log(f"    [GET?] {url} -> {gr.status_code}")
-        return gr.status_code == 200
-    except Exception as e:
-        log(f"    [GET?] error: {e}")
-        return False
-
 # ================== CORE ==================
 def page_urls_for_subscription(sub_plus: str, max_pages: int) -> List[str]:
     """
     Build: page 1 = https://www.zerochan.net/<slug>
            page n = …?p=n
-    We first unquote to neutralize any pre-encoded %xx, normalize spaces to '+',
-    then quote again with '+' kept as is.
+    Neutralize pre-encoded %xx, normalize spaces to '+', then quote with '+' safe.
     """
     normalized = unquote(sub_plus).replace(" ", "+")
     slug = quote(normalized, safe="+")  # prevents % -> %25 double-encoding
@@ -183,11 +244,10 @@ def page_urls_for_subscription(sub_plus: str, max_pages: int) -> List[str]:
         urls.append(f"{base}?p={i}")
     return urls
 
-
 def static_candidates(sub_plus: str, img_id: str) -> List[str]:
     """
     Make .jpg first, then .png
-    https://static.zerochan.net/<Name.Dot9s>.full.<id>.jpg
+    https://static.zerochan.net/<Name.Dots>.full.<id>.jpg
     """
     name_dots = sub_plus.replace("+", ".")
     base = f"https://static.zerochan.net/{name_dots}.full.{img_id}"
@@ -216,18 +276,27 @@ def run():
         print("[ABORT] No subscriptions found.")
         return
 
-    existing = build_existing_index(DEST_DIR)
+    # >>> PRE-FLIGHT: migrate any legacy files from the root into per-character folders
+    migrate_root_files_to_char_folders(DEST_DIR, subs)
+
     total_new = 0
 
     for sub in subs:
-        char_dots = sub.replace("+", ".")
-        char_key = char_dots.lower()
-        have_ids = existing.get(char_key, set())
-        log(f"\n[SUB] {sub}  (stored IDs: {len(have_ids)})")
+        # Folder per character
+        char_folder_name = folder_name_from_subscription(sub)
+        char_folder = DEST_DIR / char_folder_name
+        char_folder.mkdir(parents=True, exist_ok=True)
 
-        all_found_ids: Set[str] = set()
+        # Filenames continue to use dotted form for consistency
+        char_dots = sub.replace("+", ".")
+        log(f"\n[SUB] {sub}  → folder: {char_folder_name}")
+
+        # Preflight: only scan this character's folder
+        have_ids = build_existing_ids_for_char(char_folder)
+        log(f"  [INFO] Stored IDs in folder: {len(have_ids)}")
 
         # Gather IDs from the first N pages
+        all_found_ids: Set[str] = set()
         for url in page_urls_for_subscription(sub, MAX_PAGES_PER_TAG):
             soup = get_soup(url, dump_name=re.sub(r"[^\w]+", "_", url))
             if not soup:
@@ -247,27 +316,25 @@ def run():
         missing_ids = [i for i in sorted(all_found_ids) if i not in have_ids]
         log(f"  [INFO] Found {len(all_found_ids)} ids; missing {len(missing_ids)} new")
 
-        # Try downloading only the missing ones
+        # Download into the character's folder
         for img_id in missing_ids:
-            # Build destination filename using your scheme: <char>_<id>.<ext>
             candidates = static_candidates(sub, img_id)
             saved = False
             for cand in candidates:
                 ext = ".jpg" if cand.endswith(".jpg") else ".png"
-                dest = DEST_DIR / f"{char_dots}_{img_id}{ext}"
+                dest = char_folder / f"{char_dots}_{img_id}{ext}"
                 if dest.exists():
                     log(f"    [SKIP] exists: {dest.name}")
                     saved = True
                     break
-                if head_or_get_exists(cand) and download(cand, dest):
+                # one GET (no HEAD) to be gentler
+                if download(cand, dest):
                     saved = True
                     break
             if not saved:
                 log(f"    [MISS] Could not fetch id={img_id} as jpg/png")
             time.sleep(REQUEST_DELAY)
 
-        # Update in-memory index so later subs in this run see these IDs too
-        existing.setdefault(char_key, set()).update(missing_ids)
         total_new += len(missing_ids)
 
     print(f"\n[SUMMARY] New images downloaded this run: {total_new}")
