@@ -3,6 +3,10 @@
 A tiny Python script that downloads **full-size** images from Zerochan for a list of characters/tags you care about.
 No homepage crawling—just straight to each tag page like `https://www.zerochan.net/Saber.%28Fate%2Fstay.night%29`, collect the image **IDs**, and fetch:
 
+TL;DR
+
+Just run `setup_and_run.bat` and you should be fine.
+
 ```
 https://static.zerochan.net/<Name.Dots>.full.<ID>.jpg   (fallbacks to .png)
 ```
