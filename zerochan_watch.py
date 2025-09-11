@@ -9,6 +9,7 @@ from urllib.parse import quote, unquote
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
+from playwright.sync_api import sync_playwright
 
 # ================== CONFIG ==================
 
@@ -21,7 +22,7 @@ DEST_DIR.mkdir(parents=True, exist_ok=True)
 MAX_PAGES_PER_TAG = 3
 
 # Delay between HTTP requests (be gentle)
-REQUEST_DELAY = 2
+REQUEST_DELAY = 5
 
 # Debug knobs
 DEBUG = True
@@ -69,6 +70,33 @@ def folder_name_from_subscription(sub_plus: str) -> str:
     if s.upper() in reserved:
         s = s + " _"
     return s or "Unnamed"
+
+def get_soup_via_playwright(url: str) -> Optional[BeautifulSoup]:
+    log(f"[PW] Launching headless to fetch: {url}")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            # persist a profile to keep cookies across runs (optional):
+            # context = browser.new_context(storage_state="pw_state.json")
+            context = browser.new_context()
+            page = context.new_page()
+            page.set_extra_http_headers({"Referer": "https://www.zerochan.net/"})
+
+            # Go and wait a bit for DOM to populate:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Wait for thumbs container (best-effort, don’t hang forever)
+            try:
+                page.wait_for_selector("ul#thumbs2, ul#thumbs3, ul[id^=thumbs]", timeout=15000)
+            except Exception:
+                pass
+
+            html = page.content()
+            context.close()
+            browser.close()
+            return BeautifulSoup(html, "lxml")
+    except Exception as e:
+        log(f"[PW] Error: {e}")
+        return None
 
 # ---------- Preflight migration from root to per-character folders ----------
 
@@ -168,17 +196,22 @@ def get_soup(url: str, dump_name: Optional[str] = None) -> Optional[BeautifulSou
     try:
         r = SESSION.get(url, timeout=TIMEOUT)
         log(f"[HTTP] -> {r.status_code} ({len(r.content)} bytes)")
-        if SAVE_HTML_DEBUG and dump_name:
-            try:
-                (DEBUG_DIR / (dump_name + ".html")).write_bytes(r.content)
-            except Exception as e:
-                log(f"[WARN] Could not write debug HTML: {e}")
-        if r.status_code != 200:
-            return None
-        return BeautifulSoup(r.text, "lxml")
-    except Exception as e:
-        log(f"[ERROR] GET failed: {e}")
+        text_lower = r.text.lower() if r.status_code == 200 else ""
+
+        if r.status_code == 200 and ("just a moment" not in text_lower and "checking your browser" not in text_lower):
+            return BeautifulSoup(r.text, "lxml")
+
+        # 503/guard page fallback:
+        if r.status_code in (429, 503) or "just a moment" in text_lower or "checking your browser" in text_lower:
+            log("[HTTP] Guard detected → trying Playwright fallback…")
+            return get_soup_via_playwright(url)
+
         return None
+    except Exception as e:
+        log(f"[ERR ] GET {url}: {e}")
+        # last-ditch Playwright try:
+        return get_soup_via_playwright(url)
+
 
 def find_thumbs_ul(soup: BeautifulSoup) -> Optional[BeautifulSoup]:
     for sel in ("#thumbs2", "#thumbs3", "#thumbs", "ul[id^=thumbs]"):
